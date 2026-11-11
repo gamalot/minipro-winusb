@@ -12,6 +12,8 @@ database and the protocol are the official ones — and replaces two things arou
 
 `MiniPro.exe` itself is never modified and is not included in this repository.
 
+![The new front end: confirming a program operation, with the chip placement diagram](docs/screenshot.png)
+
 ## Contents
 
 | Part | What it is |
