@@ -1,0 +1,7 @@
+# MiniPro.exe is a 32-bit program, so both the injected DLL and the launcher must be 32-bit.
+[build]
+target = "i686-pc-windows-msvc"
+
+[target.i686-pc-windows-msvc]
+# Link the CRT statically: the DLL is loaded into a 2018-era process, don't depend on VC runtimes.
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/DEBUG:NONE"]
