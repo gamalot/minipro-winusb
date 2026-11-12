@@ -147,7 +147,24 @@ unsafe fn cstr(p: *const u8) -> String {
     if p.is_null() {
         String::new()
     } else {
-        std::ffi::CStr::from_ptr(p as *const _).to_string_lossy().into_owned()
+        from_ansi(std::ffi::CStr::from_ptr(p as *const _).to_bytes())
+    }
+}
+
+/// Text from the official program (system ANSI code page) -> UTF-8 for the pipe.
+fn from_ansi(b: &[u8]) -> String {
+    use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
+    if b.is_ascii() {
+        return String::from_utf8_lossy(b).into_owned();
+    }
+    unsafe {
+        let n = MultiByteToWideChar(CP_ACP, 0, b.as_ptr(), b.len() as i32, std::ptr::null_mut(), 0);
+        if n <= 0 {
+            return String::from_utf8_lossy(b).into_owned();
+        }
+        let mut w = vec![0u16; n as usize];
+        MultiByteToWideChar(CP_ACP, 0, b.as_ptr(), b.len() as i32, w.as_mut_ptr(), n);
+        String::from_utf16_lossy(&w)
     }
 }
 
@@ -345,13 +362,13 @@ unsafe fn window_text(hwnd: *mut c_void) -> String {
     let cap = 512;
     match send_with_buffer(hwnd, WM_GETTEXT, cap, cap, 500) {
         None => "<timeout>".into(),
-        Some((buf, n)) => String::from_utf8_lossy(&buf[..n.min(cap)]).trim_end_matches('\0').replace('\n', "\\n"),
+        Some((buf, n)) => from_ansi(&buf[..n.min(cap)]).trim_end_matches('\0').replace('\n', "\\n"),
     }
 }
 
 unsafe fn describe(hwnd: *mut c_void) -> String {
     let mut cls = [0u8; 64];
-    let n = GetClassNameA(hwnd, cls.as_mut_ptr(), cls.len() as i32) as usize;
+    let n = (GetClassNameA(hwnd, cls.as_mut_ptr(), cls.len() as i32).max(0) as usize).min(cls.len());
     let mut r = std::mem::zeroed();
     GetWindowRect(hwnd, &mut r);
     format!(
@@ -405,6 +422,20 @@ unsafe fn handle(cmd: &str) -> String {
     let hw = |i: usize| args.get(i).copied().unwrap_or(0) as *mut c_void;
     match name {
         "ping" => "pong".into(),
+        "pid" => GetCurrentProcessId().to_string(),
+        "menutext" => {
+            // menutext <hwnd> <command id>: the text of that item of the window's menu bar
+            // (the official program sets its check marks only when a menu opens, so the text is what tells the
+            // current language)
+            use windows_sys::Win32::UI::WindowsAndMessaging::{GetMenu, GetMenuStringA, MF_BYCOMMAND};
+            let menu = GetMenu(hw(0));
+            if menu.is_null() {
+                return "error: no menu".into();
+            }
+            let mut buf = [0u8; 256];
+            let n = GetMenuStringA(menu, args.get(1).copied().unwrap_or(0) as u32, buf.as_mut_ptr(), buf.len() as i32, MF_BYCOMMAND);
+            if n <= 0 { "error: no such item".into() } else { from_ansi(&buf[..(n as usize).min(buf.len())]) }
+        }
         "windows" => {
             // all top-level windows of this process (operations run on worker threads and create their own dialogs)
             let mut v: Vec<String> = Vec::new();
@@ -462,7 +493,7 @@ unsafe fn handle(cmd: &str) -> String {
                 // is unknown (timeout / LB_ERR) or absurd, the line is skipped instead of guessing a size.
                 let text = match send_len(h, 0x018A, i) {
                     Some(len) if len <= 64 * 1024 => match send_with_buffer(h, 0x0189, i, len + 64, 1000) {
-                        Some((buf, n)) if n as isize >= 0 => String::from_utf8_lossy(&buf[..n.min(len)]).into_owned(),
+                        Some((buf, n)) if n as isize >= 0 => from_ansi(&buf[..n.min(len)]),
                         _ => String::new(),
                     },
                     _ => String::new(),
@@ -492,7 +523,7 @@ unsafe fn handle(cmd: &str) -> String {
                 // SB_GETTEXTLENGTHA first: SB_GETTEXTA has no size argument either
                 let text = match send_len(h, 0x040C, i).map(|r| r & 0xFFFF) {
                     Some(len) => match send_with_buffer(h, 0x0402, i, len + 64, 1000) {
-                        Some((buf, r)) => String::from_utf8_lossy(&buf[..(r & 0xFFFF).min(len)]).into_owned(),
+                        Some((buf, r)) => from_ansi(&buf[..(r & 0xFFFF).min(len)]),
                         None => String::new(),
                     },
                     None => String::new(),
@@ -651,13 +682,67 @@ unsafe fn capture(dlg: *mut c_void, ctrl: *mut c_void, path: &str) -> String {
     }
 }
 
+static CLIENT: AtomicBool = AtomicBool::new(false);
+static HAD_CLIENT: AtomicBool = AtomicBool::new(false);
+static CLIENT_LEFT_MS: AtomicU32 = AtomicU32::new(0);
+
+fn now_ms() -> u32 {
+    T0.get().map(|t| t.elapsed().as_millis() as u32).unwrap_or(0)
+}
+
+/// Ends this hidden engine when its front end has gone away (crashed or killed) and nobody reconnects: after
+/// 30 s without a client, once the programmer has been idle for 10 s (so an operation is never cut off), the
+/// main window gets WM_CLOSE; if the process is still there 15 s later it exits.
+fn watchdog() {
+    use std::time::Duration;
+    let mut closing_since: Option<u32> = None;
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        if !HAD_CLIENT.load(Ordering::SeqCst) || CLIENT.load(Ordering::SeqCst) {
+            closing_since = None;
+            continue;
+        }
+        let now = now_ms();
+        let gone = now.saturating_sub(CLIENT_LEFT_MS.load(Ordering::SeqCst));
+        let usb_idle = (now as u64).saturating_sub(LAST_XFER_MS.load(Ordering::Relaxed));
+        match closing_since {
+            None if gone > 30_000 && usb_idle > 10_000 => {
+                log("watchdog: no front end for 30 s, closing the hidden engine");
+                unsafe { EnumWindows(Some(close_own_frames), 0) };
+                closing_since = Some(now);
+            }
+            Some(t) if now.saturating_sub(t) > 15_000 => {
+                log("watchdog: engine did not close, exiting");
+                std::process::exit(4);
+            }
+            _ => {}
+        }
+    }
+}
+
+unsafe extern "system" fn close_own_frames(hwnd: *mut c_void, _: isize) -> i32 {
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    if pid == GetCurrentProcessId() {
+        let mut cls = [0u8; 64];
+        let n = (GetClassNameA(hwnd, cls.as_mut_ptr(), cls.len() as i32).max(0) as usize).min(cls.len());
+        if cls[..n].starts_with(b"Afx:") {
+            PostMessageA(hwnd, 0x0010 /* WM_CLOSE */, 0, 0);
+        }
+    }
+    TRUE
+}
+
 fn pipe_server() {
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_FIRST_PIPE_INSTANCE;
+    use windows_sys::Win32::System::Pipes::PIPE_REJECT_REMOTE_CLIENTS;
     unsafe {
+        let mut first = true;
         loop {
             let h = CreateNamedPipeA(
                 PIPE_NAME.as_ptr(),
-                PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_ACCESS_DUPLEX | if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 },
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
                 65536,
                 65536,
@@ -665,14 +750,24 @@ fn pipe_server() {
                 std::ptr::null(),
             );
             if h == INVALID_HANDLE_VALUE {
-                log(&format!("CreateNamedPipe failed, err={}", GetLastError()));
+                let err = GetLastError();
+                log(&format!("CreateNamedPipe failed, err={err}"));
+                if first {
+                    // another hidden engine already serves the pipe: this one could never be controlled, so it
+                    // must not linger invisibly (and hold the programmer)
+                    log("another engine owns the control pipe; this one exits");
+                    std::process::exit(3);
+                }
                 return;
             }
+            first = false;
             if ConnectNamedPipe(h, std::ptr::null_mut()) == FALSE && GetLastError() != 535 {
                 // 535 = ERROR_PIPE_CONNECTED (client connected before ConnectNamedPipe)
                 windows_sys::Win32::Foundation::CloseHandle(h);
                 continue;
             }
+            CLIENT.store(true, Ordering::SeqCst);
+            HAD_CLIENT.store(true, Ordering::SeqCst);
             let mut pending: Vec<u8> = Vec::new();
             'session: loop {
                 let mut buf = [0u8; 4096];
@@ -692,6 +787,8 @@ fn pipe_server() {
                     }
                 }
             }
+            CLIENT.store(false, Ordering::SeqCst);
+            CLIENT_LEFT_MS.store(now_ms(), Ordering::SeqCst);
             DisconnectNamedPipe(h);
             windows_sys::Win32::Foundation::CloseHandle(h);
         }
@@ -706,5 +803,6 @@ pub fn init() -> bool {
     HEADLESS.store(true, Ordering::SeqCst);
     log("headless mode on");
     std::thread::spawn(pipe_server);
+    std::thread::spawn(watchdog);
     true
 }

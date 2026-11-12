@@ -66,12 +66,13 @@ wait:2;idle;read;idle;verify;idle;shot:C:\x.png;quit
 
 Steps: `wait:<s>`, `idle`, `shot:<png>`, `quit`; chip operations `read`, `verify`, `blank`, `identify`,
 `selfcheck`, `restart`, `program`, `erase` (the last two skip the confirmation — test only), `load:<file>`,
-`savebuf:<file>`, `select:<chip name>`; view `theme:auto|light|dark`, `lang:en|zh`, `zoom:<factor>`, `settings`,
+`savebuf:<file>`, `select:<chip name>`, `poke:<addr>:<byte>` (edit one buffer byte); view `theme:auto|light|dark`, `lang:en|zh`, `zoom:<factor>`, `settings`,
 `about`, `confirm`, `askselfcheck`, `picker:<text>`, `closepicker`, `goto:0x100`, `find:<hex bytes>`;
 placement-diagram development aids `socket`, `socketpng:<png>`, `socketgrid:<chip>|<chip>|…`, `socketview`
 (each `…:off` closes).  `MINIPRO_UI_LOGFILE` dumps the log on `quit`.  `MINIPRO_UI_SOCKET_PNG` /
 `MINIPRO_UI_SOCKET_FULL` are for the `capture` comparison work.  Note that `theme:`/`lang:`/`zoom:` also save
-the setting.
+the setting.  `program`, `erase` and `selfcheck` only run in a build with `--features selftest`; release builds
+refuse them.
 
 ## Build
 

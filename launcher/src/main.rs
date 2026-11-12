@@ -7,6 +7,9 @@
 // GUI subsystem: no console window flashes up.  Errors are reported with a message box instead.
 #![windows_subsystem = "windows"]
 
+#[cfg(not(target_pointer_width = "32"))]
+compile_error!("minipro-launch must be built for a 32-bit target (i686-pc-windows-msvc), like MiniPro.exe");
+
 use std::ffi::{c_void, OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -20,6 +23,34 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject, CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+/// One argument quoted for a Windows command line (the rules CommandLineToArgvW / the MSVC runtime use).
+fn quote_arg(a: &OsStr) -> OsString {
+    let s = a.to_string_lossy();
+    if !s.is_empty() && !s.contains([' ', '\t', '\n', '"']) {
+        return a.to_os_string();
+    }
+    let mut out = String::from("\"");
+    let mut backslashes = 0usize;
+    for c in s.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.push_str(&"\\".repeat(backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    OsString::from(out)
+}
 
 fn wide(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
@@ -66,7 +97,7 @@ fn main() {
     cmd.push("\"");
     for a in &rest {
         cmd.push(" ");
-        cmd.push(a);
+        cmd.push(quote_arg(a));
     }
     let mut cmd_w = wide(&cmd);
     let cwd_w = wide(target.parent().unwrap_or(&target).as_os_str());

@@ -116,7 +116,8 @@ pub fn apply(ctx: &egui::Context, p: &Palette) {
 /// CJK-capable fonts from Windows (the egui defaults have no Chinese glyphs).
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    let dir = std::path::Path::new(r"C:\Windows\Fonts");
+    let windir = std::env::var_os("WINDIR").map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    let dir = windir.join("Fonts");
     let load = |file: &str| std::fs::read(dir.join(file)).ok();
     if let Some(bytes) = load("msyh.ttc").or_else(|| load("simhei.ttf")).or_else(|| load("simsun.ttc")) {
         fonts.font_data.insert("cjk".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
@@ -131,6 +132,10 @@ pub fn install_fonts(ctx: &egui::Context) {
     if let Some(bytes) = load("SegoeIcons.ttf").or_else(|| load("segmdl2.ttf")) {
         fonts.font_data.insert("icons".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
         fonts.families.insert(FontFamily::Name("icons".into()), vec!["icons".into()]);
+    } else {
+        // no icon font: the family must still exist (egui panics on an unknown family); icons show as boxes
+        let fallback = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+        fonts.families.insert(FontFamily::Name("icons".into()), fallback);
     }
     // bold face for the labels on the adapter boards of the socket diagram (falls back to the normal fonts)
     let mut bold: Vec<String> = Vec::new();

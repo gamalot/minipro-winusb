@@ -1,6 +1,6 @@
 [package]
 name = "minipro_winusb"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 [lib]
@@ -13,6 +13,7 @@ features = [
   "Win32_Globalization",
   "Win32_Graphics_Gdi",
   "Win32_Devices_Usb",
+  "Win32_Devices_DeviceAndDriverInstallation",
   "Win32_System_IO",
   "Win32_System_LibraryLoader",
   "Win32_System_Memory",

@@ -20,6 +20,8 @@ pub struct HexView {
     /// scroll offset and viewport height of the last frame, to scroll only when the target row is not visible
     last_offset: f32,
     last_height: f32,
+    /// number of bytes that differ from `orig`, kept up to date on every edit (not recounted every frame)
+    modified: usize,
 }
 
 const ROW: f32 = 24.0;
@@ -32,12 +34,30 @@ impl HexView {
         self.half = false;
         self.dirty = false;
         self.match_len = 0;
+        self.modified = 0;
         self.scroll_to_row = Some(0);
     }
 
     pub fn mark_clean(&mut self) {
         self.orig = self.data.clone();
         self.dirty = false;
+        self.modified = 0;
+    }
+
+    /// Recount the edited bytes (after the data was changed from outside the editor).
+    pub fn recount(&mut self) {
+        self.modified = self.data.iter().zip(self.orig.iter()).filter(|(a, b)| a != b).count();
+    }
+
+    fn set_byte(&mut self, i: usize, v: u8) {
+        let was = self.orig.get(i).is_some_and(|o| *o != self.data[i]);
+        self.data[i] = v;
+        let now = self.orig.get(i).is_some_and(|o| *o != v);
+        match (was, now) {
+            (false, true) => self.modified += 1,
+            (true, false) => self.modified = self.modified.saturating_sub(1),
+            _ => {}
+        }
     }
 
     pub fn goto(&mut self, addr: usize) {
@@ -68,7 +88,7 @@ impl HexView {
     }
 
     pub fn modified_count(&self) -> usize {
-        self.data.iter().zip(self.orig.iter()).filter(|(a, b)| a != b).count()
+        self.modified
     }
 
     fn move_cursor(&mut self, delta: i64) {
@@ -89,10 +109,10 @@ impl HexView {
         self.match_len = 0;
         let b = self.data[self.cursor];
         if !self.half {
-            self.data[self.cursor] = (d << 4) | (b & 0x0F);
+            self.set_byte(self.cursor, (d << 4) | (b & 0x0F));
             self.half = true;
         } else {
-            self.data[self.cursor] = (b & 0xF0) | d;
+            self.set_byte(self.cursor, (b & 0xF0) | d);
             self.half = false;
             if self.cursor + 1 < self.data.len() {
                 self.cursor += 1;

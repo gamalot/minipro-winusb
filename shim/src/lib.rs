@@ -16,6 +16,10 @@
 
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
+// MiniPro.exe is a 32-bit program and the import-table patching below writes 4-byte slots.
+#[cfg(not(target_pointer_width = "32"))]
+compile_error!("minipro_winusb must be built for a 32-bit target (i686-pc-windows-msvc), like MiniPro.exe");
+
 use std::ffi::c_void;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -127,11 +131,21 @@ type RegisterDeviceNotificationAFn =
 // ---------------------------------------------------------------------------------------------
 
 pub(crate) fn log(msg: &str) {
+    // the log starts empty with every run; within a run it stops at 4 MB
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static WRITTEN: AtomicUsize = AtomicUsize::new(0);
+    const CAP: usize = 4 * 1024 * 1024;
     if let Ok(mut g) = LOG.lock() {
         if let Some(f) = g.as_mut() {
+            let done = WRITTEN.load(Ordering::Relaxed);
+            if done >= CAP {
+                return;
+            }
             let ms = T0.get().map(|t| t.elapsed().as_millis()).unwrap_or(0);
-            let _ = writeln!(f, "[{ms:>8}] {msg}");
+            let line = if done + msg.len() + 16 >= CAP { "log size limit reached; further messages are dropped".to_string() } else { msg.to_string() };
+            let _ = writeln!(f, "[{ms:>8}] {line}");
             let _ = f.flush();
+            WRITTEN.store(if line == msg { done + msg.len() + 12 } else { CAP }, Ordering::Relaxed);
         }
     }
 }
@@ -194,16 +208,41 @@ fn parse_guid(s: &str) -> Option<GUID> {
     Some(GUID { data1: d1, data2: d2, data3: d3, data4: d4 })
 }
 
-/// Read DeviceInterfaceGUIDs of the present VID_04D8&PID_E11C device from the registry
-/// (written there by the WinUSB INF that Zadig installs).
+/// Is a device with interface `g` present right now?
+fn interface_present(g: &GUID) -> bool {
+    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+        SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
+        SP_DEVICE_INTERFACE_DATA,
+    };
+    unsafe {
+        let set = SetupDiGetClassDevsW(g, std::ptr::null(), std::ptr::null_mut(), DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        if set as isize == -1 || set as usize == 0 {
+            return false;
+        }
+        let mut d: SP_DEVICE_INTERFACE_DATA = std::mem::zeroed();
+        d.cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32;
+        let found = SetupDiEnumDeviceInterfaces(set, std::ptr::null(), g, 0, &mut d) != 0;
+        SetupDiDestroyDeviceInfoList(set);
+        found
+    }
+}
+
+/// DeviceInterfaceGUIDs of the VID_04D8&PID_E11C device instances in the registry (written there by the WinUSB
+/// INF that Zadig installs).  Every instance (USB port) has its own entry and they can differ after reinstalling
+/// the driver, so the GUID of the device that is present now is preferred; otherwise the first one found.
 fn guid_from_registry() -> Option<GUID> {
+    let all = guids_from_registry();
+    all.iter().copied().find(interface_present).or_else(|| all.first().copied())
+}
+
+fn guids_from_registry() -> Vec<GUID> {
     // Use reg.exe-free approach: windows-sys registry API would need another feature, and
     // a tiny dynamic lookup keeps the dependency surface small.
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
     unsafe {
         let adv = LoadLibraryA(b"advapi32.dll\0".as_ptr());
         if adv.is_null() {
-            return None;
+            return Vec::new();
         }
         type RegOpenKeyExW = unsafe extern "system" fn(isize, *const u16, u32, u32, *mut isize) -> i32;
         type RegEnumKeyExW = unsafe extern "system" fn(
@@ -212,11 +251,18 @@ fn guid_from_registry() -> Option<GUID> {
         type RegQueryValueExW =
             unsafe extern "system" fn(isize, *const u16, *mut u32, *mut u32, *mut u8, *mut u32) -> i32;
         type RegCloseKey = unsafe extern "system" fn(isize) -> i32;
-        let open: RegOpenKeyExW = std::mem::transmute(GetProcAddress(adv, b"RegOpenKeyExW\0".as_ptr())?);
-        let enumk: RegEnumKeyExW = std::mem::transmute(GetProcAddress(adv, b"RegEnumKeyExW\0".as_ptr())?);
-        let query: RegQueryValueExW =
-            std::mem::transmute(GetProcAddress(adv, b"RegQueryValueExW\0".as_ptr())?);
-        let close: RegCloseKey = std::mem::transmute(GetProcAddress(adv, b"RegCloseKey\0".as_ptr())?);
+        let (Some(o), Some(e), Some(q), Some(c)) = (
+            GetProcAddress(adv, b"RegOpenKeyExW\0".as_ptr()),
+            GetProcAddress(adv, b"RegEnumKeyExW\0".as_ptr()),
+            GetProcAddress(adv, b"RegQueryValueExW\0".as_ptr()),
+            GetProcAddress(adv, b"RegCloseKey\0".as_ptr()),
+        ) else {
+            return Vec::new();
+        };
+        let open: RegOpenKeyExW = std::mem::transmute(o);
+        let enumk: RegEnumKeyExW = std::mem::transmute(e);
+        let query: RegQueryValueExW = std::mem::transmute(q);
+        let close: RegCloseKey = std::mem::transmute(c);
 
         let w = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
         const HKLM: isize = 0x8000_0002u32 as i32 as isize;
@@ -224,9 +270,9 @@ fn guid_from_registry() -> Option<GUID> {
         let base = r"SYSTEM\CurrentControlSet\Enum\USB\VID_04D8&PID_E11C";
         let mut hk = 0isize;
         if open(HKLM, w(base).as_ptr(), 0, KEY_READ, &mut hk) != 0 {
-            return None;
+            return Vec::new();
         }
-        let mut found = None;
+        let mut found = Vec::new();
         let mut idx = 0u32;
         loop {
             let mut name = [0u16; 256];
@@ -250,8 +296,7 @@ fn guid_from_registry() -> Option<GUID> {
                 let u16s: Vec<u16> = data[..sz as usize].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
                 let first = String::from_utf16_lossy(&u16s);
                 if let Some(g) = parse_guid(first.split('\0').next().unwrap_or("")) {
-                    found = Some(g);
-                    break;
+                    found.push(g);
                 }
             }
         }
@@ -272,8 +317,20 @@ fn fmt_guid(g: &GUID) -> String {
     )
 }
 
+/// The WinUSB interface GUID, resolved on first use (from a hook, not from DllMain).
 fn new_guid() -> GUID {
-    *NEW_GUID.get_or_init(|| guid_from_registry().unwrap_or(DEFAULT_NEW_GUID))
+    *NEW_GUID.get_or_init(|| {
+        let g = guid_from_registry().unwrap_or(DEFAULT_NEW_GUID);
+        log!("WinUSB interface GUID = {}", fmt_guid(&g));
+        g
+    })
+}
+
+/// Log every USB transfer with the first bytes of its data only when MINIPRO_WINUSB_TRACE is set; by default
+/// only failures are logged (the data is chip content and the log would grow with every transfer).
+fn trace() -> bool {
+    static T: OnceLock<bool> = OnceLock::new();
+    *T.get_or_init(|| std::env::var_os("MINIPRO_WINUSB_TRACE").is_some())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -428,8 +485,10 @@ unsafe extern "system" fn hook_device_io_control(
             let mut n = 0u32;
             let ok = WinUsb_WritePipe(iface, d.pipe_out, inb as *const u8, in_sz, &mut n, std::ptr::null());
             let err = if ok == 0 { windows_sys::Win32::Foundation::GetLastError() } else { 0 };
-            log!("WRITE {in_sz:>4} B -> {} (n={n}, err={err})  [{}]",
-                 if ok != 0 { "ok" } else { "FAIL" }, hex(inb as *const u8, in_sz as usize));
+            if ok == 0 || trace() {
+                log!("WRITE {in_sz:>4} B -> {} (n={n}, err={err})  [{}]",
+                     if ok != 0 { "ok" } else { "FAIL" }, hex(inb as *const u8, in_sz as usize));
+            }
             if !ret.is_null() {
                 *ret = n;
             }
@@ -453,8 +512,11 @@ unsafe extern "system" fn hook_device_io_control(
             let mut n = 0u32;
             let ok = WinUsb_ReadPipe(iface, d.pipe_in, outb as *mut u8, out_sz, &mut n, std::ptr::null());
             let err = if ok == 0 { windows_sys::Win32::Foundation::GetLastError() } else { 0 };
-            log!("READ  {out_sz:>4} B (timeout {timeout} ms) -> {} (n={n}, err={err})  [{}]",
-                 if ok != 0 { "ok" } else { "FAIL" }, hex(outb as *const u8, n as usize));
+            // a read that times out is normal polling; only log real failures (and everything when tracing)
+            if trace() || (ok == 0 && err != 121 /* ERROR_SEM_TIMEOUT */) {
+                log!("READ  {out_sz:>4} B (timeout {timeout} ms) -> {} (n={n}, err={err})  [{}]",
+                     if ok != 0 { "ok" } else { "FAIL" }, hex(outb as *const u8, n as usize));
+            }
             if !ret.is_null() {
                 *ret = n;
             }
@@ -521,7 +583,7 @@ unsafe fn find_iat_slot(func: &[u8]) -> *mut usize {
 unsafe fn install() {
     let _ = T0.set(Instant::now());
     open_log();
-    log!("minipro_winusb shim loaded; WinUSB interface GUID = {}", fmt_guid(&new_guid()));
+    log!("minipro_winusb shim loaded");
     let headless = headless::init();
     let mut hooks: Vec<(&[u8], usize, &AtomicUsize)> = vec![
         (b"SetupDiEnumDeviceInterfaces", hook_setupdi_enum_device_interfaces as *const () as usize, &ORIG_ENUMIF),
@@ -552,7 +614,10 @@ unsafe fn install() {
             continue;
         }
         let mut old_prot = 0u32;
-        VirtualProtect(slot as *const c_void, 4, PAGE_READWRITE, &mut old_prot);
+        if VirtualProtect(slot as *const c_void, 4, PAGE_READWRITE, &mut old_prot) == 0 {
+            log!("cannot unprotect the import of {}; not hooked", String::from_utf8_lossy(name));
+            continue;
+        }
         *slot = *hook;
         VirtualProtect(slot as *const c_void, 4, old_prot, &mut old_prot);
         log!("hooked {}", String::from_utf8_lossy(name));

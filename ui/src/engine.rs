@@ -140,6 +140,8 @@ pub enum Event {
     Ready,
     Busy(bool),
     Fatal(String),
+    /// the engine has been shut down after Job::Quit
+    Quitted,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -229,6 +231,36 @@ pub struct Engine {
     form: HashMap<i32, String>,
     tx: Sender<Event>,
     ctx: egui::Context,
+    /// the control pipe failed: the engine crashed or exited; every further call is skipped
+    broken: bool,
+    /// process id of the hidden MiniPro.exe, to make sure it is really gone on quit / restart
+    pid: u32,
+    /// the official program was set to Chinese and was switched to English for this session
+    zh_restore: bool,
+}
+
+fn engine_lost() -> &'static str {
+    tr("编程引擎没有响应（可能已经退出）", "The programming engine stopped responding (it may have exited)")
+}
+
+/// Waits up to `grace_ms` for process `pid` to exit, then terminates it.
+fn end_process(pid: u32, grace_ms: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
+    if pid == 0 {
+        return;
+    }
+    unsafe {
+        let h = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid);
+        if h.is_null() {
+            return; // already gone
+        }
+        if WaitForSingleObject(h, grace_ms) != 0 {
+            TerminateProcess(h, 1);
+            WaitForSingleObject(h, 3000);
+        }
+        CloseHandle(h);
+    }
 }
 
 /// A file in the temp directory for exchanging the buffer with the official program.  MiniPro is an ANSI
@@ -268,7 +300,28 @@ impl Engine {
     }
 
     fn call(&mut self, cmd: &str) -> Vec<String> {
-        self.pipe.call(cmd).unwrap_or_default()
+        if self.broken {
+            return Vec::new();
+        }
+        match self.pipe.call(cmd) {
+            Ok(v) => v,
+            Err(_) => {
+                self.broken = true;
+                Vec::new()
+            }
+        }
+    }
+
+    /// Restores the official program's language if it was switched, closes it, and makes sure the process is
+    /// gone (terminated after `grace_ms`).
+    fn shutdown(&mut self, grace_ms: u32) {
+        let frame = self.frame.clone();
+        if self.zh_restore {
+            self.post(&frame, WM_COMMAND, 32834);
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        self.post(&frame, WM_CLOSE, 0);
+        end_process(self.pid, grace_ms);
     }
 
     fn windows(&mut self) -> Vec<Win> {
@@ -307,7 +360,7 @@ impl Engine {
     /// Wait for a top-level dialog that is not in `known` and that contains control `must_have`.
     fn wait_dialog(&mut self, known: &[String], must_have: i32, timeout: Duration) -> Option<(Win, Vec<Win>)> {
         let t0 = Instant::now();
-        while t0.elapsed() < timeout {
+        while t0.elapsed() < timeout && !self.broken {
             for d in self.dialogs() {
                 if known.contains(&d.hwnd) {
                     continue;
@@ -348,7 +401,7 @@ impl Engine {
             pipe = Pipe::connect(Duration::from_secs(25));
         }
         let pipe = pipe.ok_or(tr("无法连接到官方程序的控制通道", "Cannot connect to the official program's control channel"))?;
-        let mut e = Engine { pipe, frame: String::new(), form: HashMap::new(), tx, ctx };
+        let mut e = Engine { pipe, frame: String::new(), form: HashMap::new(), tx, ctx, broken: false, pid: 0, zh_restore: false };
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_secs(25) {
             if let Some(w) = e.windows().into_iter().find(|w| w.class.starts_with("Afx:") && w.text.contains("MiniPro")) {
@@ -361,8 +414,22 @@ impl Engine {
             return Err(tr("官方程序主窗口没有出现", "The official program's main window did not appear").into());
         }
         std::thread::sleep(Duration::from_millis(600));
+        e.pid = e.call("pid").first().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        // Results are recognised by the official program's English texts: if it is set to Chinese, switch it to
+        // English for this session (it is switched back on exit).
+        let frame = e.frame.clone();
+        // (menu item "Read" in English, non-ASCII in Chinese)
+        let read_item = e.call(&format!("menutext {frame} 1002")).join("");
+        if !read_item.starts_with("error") && !read_item.trim().is_empty() && !read_item.is_ascii() {
+            e.post(&frame, WM_COMMAND, 32835);
+            std::thread::sleep(Duration::from_millis(800));
+            e.zh_restore = true;
+        }
         e.cache_form();
         e.dismiss_startup_dialogs();
+        if e.broken {
+            return Err(engine_lost().into());
+        }
         Ok(e)
     }
 
@@ -571,25 +638,29 @@ impl Engine {
         false
     }
 
-    fn fetch_buffer(&mut self) -> Option<Vec<u8>> {
+    /// Saves the official buffer to a temp file and reads it back.  The file is taken only once it is complete:
+    /// as long as the chip size (`expected`) when that is known, and in any case unchanged between two polls.
+    fn fetch_buffer(&mut self, expected: u64) -> Option<Vec<u8>> {
         let path = temp_file("minipro_ui_dump.bin");
         let _ = std::fs::remove_file(&path);
         let frame = self.frame.clone();
         self.call(&format!("arm-save 0 {}", path.display()));
         self.post(&frame, WM_COMMAND, 1007);
         let t0 = Instant::now();
-        while t0.elapsed() < Duration::from_secs(10) {
-            if let Ok(m) = std::fs::metadata(&path) {
-                if m.len() > 0 {
-                    std::thread::sleep(Duration::from_millis(250));
-                    let data = std::fs::read(&path).ok();
-                    let _ = std::fs::remove_file(&path);
-                    return data;
-                }
+        let mut last: Option<u64> = None;
+        while t0.elapsed() < Duration::from_secs(20) && !self.broken {
+            std::thread::sleep(Duration::from_millis(200));
+            let Ok(m) = std::fs::metadata(&path) else { continue };
+            let len = m.len();
+            if len > 0 && (expected == 0 || len == expected) && last == Some(len) {
+                let data = std::fs::read(&path).ok().filter(|d| d.len() as u64 == len);
+                let _ = std::fs::remove_file(&path);
+                return data;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            last = Some(len);
         }
         self.call("disarm");
+        let _ = std::fs::remove_file(&path);
         None
     }
 
@@ -698,6 +769,9 @@ impl Engine {
         let mut settle = 0;
         loop {
             std::thread::sleep(Duration::from_millis(150));
+            if self.broken {
+                return (false, engine_lost().into());
+            }
             let enabled = self.is_enabled(&go);
             let lines = self.lb(&logl);
             if !enabled || lines.len() > seen {
@@ -781,6 +855,9 @@ impl Engine {
         self.call("events");
         self.post(&frame, WM_COMMAND, op.menu());
         let Some((dlg, tree)) = self.wait_dialog(&known, 1056, Duration::from_secs(6)) else {
+            if self.broken {
+                return (false, engine_lost().into());
+            }
             return (false, tr("官方程序没有打开操作窗口", "The official program did not open the operation window").into());
         };
         let go = tree.iter().find(|w| w.id == 1).map(|w| w.hwnd.clone()).unwrap_or_default();
@@ -808,6 +885,9 @@ impl Engine {
         let mut final_wait = 0;
         loop {
             std::thread::sleep(Duration::from_millis(110));
+            if self.broken {
+                return (false, engine_lost().into());
+            }
             let enabled = self.is_enabled(&go);
             if !enabled {
                 was_busy = true;
@@ -818,7 +898,18 @@ impl Engine {
                 started = true;
             }
             if !started {
-                if !retried && t0.elapsed() > Duration::from_millis(2500) {
+                // any USB traffic since the click means the operation did start, just slowly
+                let stats = self.call("stats").join(" ");
+                let ops: u64 = ["in_ops=", "out_ops="]
+                    .iter()
+                    .map(|k| stats.split_whitespace().find_map(|p| p.strip_prefix(k)).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0))
+                    .sum();
+                if ops > 0 {
+                    started = true;
+                }
+            }
+            if !started {
+                if !retried && t0.elapsed() > Duration::from_millis(3000) {
                     retried = true;
                     self.log(Level::Warn, tr("操作窗口没有响应，重新点击一次", "The operation window did not respond, clicking again"));
                     self.dismiss_stray_dialogs();
@@ -952,8 +1043,8 @@ pub fn spawn(ctx: egui::Context) -> (Sender<Job>, Receiver<Event>) {
             }
             match job {
                 Job::Quit => {
-                    let frame = engine.frame.clone();
-                    engine.post(&frame, WM_CLOSE, 0);
+                    engine.shutdown(6000);
+                    engine.send(Event::Quitted);
                     break;
                 }
                 Job::Refresh => {
@@ -981,23 +1072,19 @@ pub fn spawn(ctx: egui::Context) -> (Sender<Job>, Receiver<Event>) {
                     engine.post(&frame, WM_COMMAND, 32798);
                     std::thread::sleep(Duration::from_millis(1800));
                     let st = engine.read_state();
-                    engine.log(Level::Ok, trf!("芯片 ID: {}", "Chip ID: {}", st.chip_id));
+                    if st.chip_id.is_empty() {
+                        engine.log(Level::Warn, tr("没有读到芯片 ID（检查芯片是否插好）", "No chip ID was read (check that the chip is inserted correctly)"));
+                    } else {
+                        engine.log(Level::Ok, trf!("芯片 ID: {}", "Chip ID: {}", st.chip_id));
+                    }
                     engine.send(Event::State(st));
                 }
                 Job::Restart => {
                     engine.log(Level::Info, tr("编程器重新连接，正在重启编程引擎…", "Programmer reconnected, restarting the engine…"));
                     engine.progress(None, tr("正在重启编程引擎…", "Restarting the engine…"));
-                    let frame = engine.frame.clone();
-                    engine.post(&frame, WM_CLOSE, 0);
-                    // wait until the old process has really gone (its control pipe stops answering)
-                    let t0 = Instant::now();
-                    while t0.elapsed() < Duration::from_secs(8) {
-                        if engine.call("ping").is_empty() {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(200));
-                    }
-                    std::thread::sleep(Duration::from_millis(800));
+                    // the old process must really be gone before a new one is started (it holds the pipe)
+                    engine.shutdown(8000);
+                    std::thread::sleep(Duration::from_millis(500));
                     match Engine::start(etx.clone(), ctx.clone()) {
                         Ok(e) => {
                             engine = e;
@@ -1051,15 +1138,21 @@ pub fn spawn(ctx: egui::Context) -> (Sender<Job>, Receiver<Event>) {
                     };
                     engine.send(Event::OpDone { op: op.label(), ok, summary });
                     let st = engine.read_state();
+                    let size = st.size;
                     engine.send(Event::State(st));
                     if op == Op::Read && ok {
-                        if let Some(d) = engine.fetch_buffer() {
-                            engine.send(Event::Buffer(d));
+                        match engine.fetch_buffer(size) {
+                            Some(d) => engine.send(Event::Buffer(d)),
+                            None => engine.log(
+                                Level::Error,
+                                tr("读取成功，但没能把数据取回界面；屏幕上仍是之前的内容", "The read succeeded, but the data could not be brought into the window; the screen still shows the previous content"),
+                            ),
                         }
                     }
                 }
                 Job::FetchBuffer => {
-                    if let Some(d) = engine.fetch_buffer() {
+                    let size = engine.read_state().size;
+                    if let Some(d) = engine.fetch_buffer(size) {
                         engine.send(Event::Buffer(d));
                     }
                 }
@@ -1067,6 +1160,25 @@ pub fn spawn(ctx: egui::Context) -> (Sender<Job>, Receiver<Event>) {
                     engine.set_option(opt, on);
                     let st = engine.read_state();
                     engine.send(Event::State(st));
+                }
+            }
+            if engine.broken {
+                // the hidden engine crashed or exited: start a new one instead of reporting fake empty results
+                engine.log(Level::Info, tr("正在重新启动编程引擎…", "Restarting the programming engine…"));
+                engine.shutdown(2000);
+                std::thread::sleep(Duration::from_millis(500));
+                match Engine::start(etx.clone(), ctx.clone()) {
+                    Ok(e) => {
+                        engine = e;
+                        let st = engine.read_state();
+                        engine.send(Event::State(st));
+                        engine.send(Event::Restarted);
+                        engine.log(Level::Ok, tr("编程引擎已重启", "Engine restarted"));
+                    }
+                    Err(msg) => {
+                        engine.send(Event::Fatal(msg));
+                        break;
+                    }
                 }
             }
             engine.progress(Some(0.0), "");

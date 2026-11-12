@@ -190,6 +190,9 @@ pub struct App {
     info_tries: u32,
     last_info: Instant,
     needs_restart: bool,
+    /// closing was requested while an operation runs: ask first
+    ask_close: bool,
+    force_close: bool,
     settings: bool,
     /// UI scale (egui zoom factor), saved in the settings
     zoom: f32,
@@ -274,6 +277,8 @@ impl App {
             info_tries: 0,
             last_info: Instant::now(),
             needs_restart: false,
+            ask_close: false,
+            force_close: false,
             settings: false,
             zoom,
             zoom_resize: 2,
@@ -328,6 +333,9 @@ impl App {
         }
         self.script_i += 1;
         match cmd {
+            "program" | "erase" | "selfcheck" if !cfg!(feature = "selftest") => {
+                self.say(Level::Warn, format!("[test] step {cmd:?} needs a build with the selftest feature"))
+            }
             "wait" => self.script_wait = Some(Instant::now() + Duration::from_secs_f32(arg.parse().unwrap_or(1.0))),
             "shot" => {
                 let path = arg.to_string();
@@ -416,6 +424,7 @@ impl App {
                         if let Some(b) = self.hex.data.get_mut(addr) {
                             *b = val;
                             self.hex.dirty = true;
+                            self.hex.recount();
                         }
                     }
                 }
@@ -584,6 +593,7 @@ impl App {
                     self.info_tries = 0;
                 }
                 Event::Busy(b) => self.busy = b,
+                Event::Quitted => {}
                 Event::Fatal(m) => {
                     self.fatal = Some(m);
                     self.busy = false;
@@ -1271,7 +1281,9 @@ impl App {
                         }
                     });
                     ui.add_space(2.0);
-                    let keys = !ui.ctx().egui_wants_keyboard_input() && self.picker == false;
+                    // typed hex digits edit the buffer only when no dialog is open and no operation is running
+                    let modal_open = self.picker || self.pending.is_some() || self.pending_selfcheck || self.settings || self.about || self.socket_view || self.ask_close;
+                    let keys = !ui.ctx().egui_wants_keyboard_input() && !modal_open && !self.busy;
                     let footer_h = 30.0;
                     let avail = ui.available_height() - footer_h;
                     ui.allocate_ui(Vec2::new(ui.available_width(), avail.max(100.0)), |ui| {
@@ -1396,6 +1408,46 @@ impl App {
         }
     }
 
+    /// Asked when the window is closed while an operation is running.
+    fn close_while_busy_dialog(&mut self, ctx: &egui::Context) {
+        if !self.ask_close {
+            return;
+        }
+        if !self.busy {
+            self.ask_close = false; // finished in the meantime
+            return;
+        }
+        let pal = self.pal;
+        let mut decision: Option<bool> = None;
+        let close = modal(ctx, &pal, "close-busy", tr("操作还在进行", "An operation is running"), 460.0, |ui| {
+            ui.label(
+                RichText::new(tr(
+                    "现在关闭会中止当前操作。如果正在编程或擦除，芯片可能只写了一部分。",
+                    "Closing now aborts the current operation. If it is programming or erasing, the chip may be left partly written.",
+                ))
+                .size(15.5),
+            );
+            let (go, cancel) = dialog_buttons(ui, &pal, tr("仍然关闭", "Close anyway"), pal.err);
+            if go {
+                decision = Some(true);
+            } else if cancel {
+                decision = Some(false);
+            }
+        });
+        if close {
+            decision = decision.or(Some(false));
+        }
+        match decision {
+            Some(true) => {
+                self.ask_close = false;
+                self.force_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Some(false) => self.ask_close = false,
+            None => {}
+        }
+    }
+
     fn selfcheck_dialog(&mut self, ctx: &egui::Context) {
         if !self.pending_selfcheck {
             return;
@@ -1481,7 +1533,14 @@ impl eframe::App for App {
         if !self.script.is_empty() && self.script_i < self.script.len() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
+        if ctx.input(|i| i.viewport().close_requested()) && self.busy && self.ready && !self.force_close && self.fatal.is_none() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.ask_close = true;
+        }
         if let Some(msg) = self.fatal.clone() {
+            // keep the own title bar: without the system frame it is the only way to move or close the window
+            self.resize_handles(&ctx);
+            self.top_bar(ui);
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() * 0.35);
@@ -1510,6 +1569,7 @@ impl eframe::App for App {
         self.selfcheck_dialog(&ctx);
         self.about_window(&ctx);
         self.socket_window(&ctx);
+        self.close_while_busy_dialog(&ctx);
         if !self.socket_grid.is_empty() {
             let pal = self.pal;
             egui::Area::new(egui::Id::new("socket_grid")).fixed_pos(egui::pos2(8.0, 8.0)).order(egui::Order::Foreground).show(&ctx, |ui| {
@@ -1536,7 +1596,15 @@ impl eframe::App for App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        // the worker closes the official program and makes sure its process is gone (it may be finishing a job
+        // first); never leave a hidden MiniPro.exe behind holding the programmer
         let _ = self.tx.send(Job::Quit);
-        std::thread::sleep(Duration::from_millis(500));
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(30) {
+            match self.rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Event::Quitted) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                _ => {}
+            }
+        }
     }
 }

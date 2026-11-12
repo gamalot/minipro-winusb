@@ -27,8 +27,8 @@ fn hex_byte(s: &str, i: usize) -> Option<u8> {
 
 /// Intel HEX -> flat image starting at address 0 (gaps are filled with 0xFF).
 pub fn parse_ihex(text: &str) -> Result<Vec<u8>, String> {
-    let mut base: usize = 0;
-    let mut chunks: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut base: u64 = 0;
+    let mut chunks: Vec<(u64, Vec<u8>)> = Vec::new();
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -47,22 +47,30 @@ pub fn parse_ihex(text: &str) -> Result<Vec<u8>, String> {
             return Err(trf!("第 {} 行校验和错误", "Line {} has a bad checksum", n + 1));
         }
         match typ {
-            0x00 => chunks.push((base + addr, data)),
+            0x00 => chunks.push((base + addr as u64, data)),
             0x01 => break,
-            0x02 => base = (((data[0] as usize) << 8) | data[1] as usize) << 4,
-            0x04 => base = (((data[0] as usize) << 8) | data[1] as usize) << 16,
+            0x02 | 0x04 => {
+                if data.len() != 2 {
+                    return Err(trf!("第 {} 行的扩展地址记录长度不对", "Line {} has an extended address record of the wrong length", n + 1));
+                }
+                let v = ((data[0] as u64) << 8) | data[1] as u64;
+                base = if typ == 0x02 { v << 4 } else { v << 16 };
+            }
             _ => {}
         }
     }
-    let end = chunks.iter().map(|(a, d)| a + d.len()).max().unwrap_or(0);
+    // u64 arithmetic: on this 32-bit program a usize sum of base + address + length could overflow
+    const MAX: u64 = 256 * 1024 * 1024;
+    let end = chunks.iter().map(|(a, d)| a + d.len() as u64).max().unwrap_or(0);
     if end == 0 {
         return Err(tr("文件中没有数据", "The file contains no data").into());
     }
-    if end > 256 * 1024 * 1024 {
+    if end > MAX {
         return Err(tr("地址范围过大", "Address range too large").into());
     }
-    let mut img = vec![0xFFu8; end];
+    let mut img = vec![0xFFu8; end as usize];
     for (a, d) in chunks {
+        let a = a as usize;
         img[a..a + d.len()].copy_from_slice(&d);
     }
     Ok(img)
