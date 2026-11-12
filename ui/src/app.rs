@@ -214,7 +214,6 @@ pub struct App {
     results_for: String,
 
     hex: HexView,
-    synced: bool,
     file_name: Option<String>,
 
     log: Vec<(f32, Level, String)>,
@@ -292,7 +291,6 @@ impl App {
             results: Vec::new(),
             results_for: "\u{0}".into(),
             hex: HexView::default(),
-            synced: true,
             file_name: None,
             log: Vec::new(),
             t0: Instant::now(),
@@ -400,7 +398,6 @@ impl App {
                 Ok(d) => {
                     self.say(Level::Ok, trf!("[自检] 已载入 {arg} ({} 字节)", "[test] loaded {arg} ({} bytes)", with_commas(d.len() as u64)));
                     self.hex.set_data(d);
-                    self.synced = false;
                 }
                 Err(e) => self.say(Level::Error, trf!("[自检] 载入失败: {e}", "[test] load failed: {e}")),
             },
@@ -408,6 +405,19 @@ impl App {
                 if let Some(c) = self.chips.iter().find(|c| c.name == arg).cloned() {
                     self.busy = true;
                     let _ = self.tx.send(Job::SelectChip(c));
+                }
+            }
+            // self-test only: change one byte as if it had been typed in the editor, e.g. `poke:0x10:AB`
+            "poke" => {
+                if let Some((addr, val)) = arg.split_once(':') {
+                    let addr = usize::from_str_radix(addr.trim_start_matches("0x"), 16).ok();
+                    let val = u8::from_str_radix(val, 16).ok();
+                    if let (Some(addr), Some(val)) = (addr, val) {
+                        if let Some(b) = self.hex.data.get_mut(addr) {
+                            *b = val;
+                            self.hex.dirty = true;
+                        }
+                    }
                 }
             }
             "goto" => {
@@ -531,7 +541,6 @@ impl App {
                         with_commas(ff as u64)
                     ));
                     self.hex.set_data(d);
-                    self.synced = true;
                     self.file_name = None;
                 }
                 Event::ChipList(list) => {
@@ -571,8 +580,6 @@ impl App {
                     self.socket = img;
                 }
                 Event::Restarted => {
-                    // the new engine has an empty buffer: push ours again before the next write/verify
-                    self.synced = false;
                     self.info_wanted = true;
                     self.info_tries = 0;
                 }
@@ -706,13 +713,11 @@ impl App {
                     ));
                 return;
             }
-            if !self.synced {
-                let _ = self.tx.send(Job::LoadBuffer(self.hex.data.clone()));
-                self.synced = true;
-            }
         }
+        // program / verify always take the data that is on screen right now (edits, opened file, ...)
+        let data = matches!(op, Op::Program | Op::Verify).then(|| self.hex.data.clone());
         self.busy = true;
-        let _ = self.tx.send(Job::Run(op));
+        let _ = self.tx.send(Job::Run(op, data));
     }
 
     fn open_file(&mut self) {
@@ -728,7 +733,6 @@ impl App {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 self.say(Level::Ok, trf!("已打开 {name} ({} 字节)", "Opened {name} ({} bytes)", with_commas(d.len() as u64)));
                 self.hex.set_data(d);
-                self.synced = false;
                 self.file_name = Some(name);
             }
             Err(e) => self.say(Level::Error, trf!("打开失败: {e}", "Open failed: {e}")),

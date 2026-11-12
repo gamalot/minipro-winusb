@@ -218,6 +218,28 @@ unsafe fn multistr(p: *const u8) -> String {
     parts.chunks(2).map(|c| c.join("|")).collect::<Vec<_>>().join(" ; ")
 }
 
+/// UTF-8 -> system ANSI code page; None if any character has no exact representation there.
+fn to_ansi(s: &str) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Globalization::{WideCharToMultiByte, CP_ACP, WC_NO_BEST_FIT_CHARS};
+    if s.is_ascii() {
+        return Some(s.as_bytes().to_vec());
+    }
+    let w: Vec<u16> = s.encode_utf16().collect();
+    unsafe {
+        let mut used = 0i32;
+        let n = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, w.as_ptr(), w.len() as i32, std::ptr::null_mut(), 0, std::ptr::null(), &mut used);
+        if n <= 0 || used != 0 {
+            return None;
+        }
+        let mut out = vec![0u8; n as usize];
+        let m = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, w.as_ptr(), w.len() as i32, out.as_mut_ptr(), n, std::ptr::null(), &mut used);
+        if m != n || used != 0 {
+            return None;
+        }
+        Some(out)
+    }
+}
+
 type GetFileNameAFn = unsafe extern "system" fn(*mut OpenFileNameA) -> i32;
 
 unsafe fn file_dialog(save: bool, ofn: *mut OpenFileNameA) -> i32 {
@@ -241,15 +263,22 @@ unsafe fn file_dialog(save: bool, ofn: *mut OpenFileNameA) -> i32 {
     let Some((idx, path)) = armed else {
         return 0; // cancel: never show a system file dialog while headless
     };
-    let bytes = path.as_bytes();
+    // MiniPro is an ANSI program: give it the path in the system code page.  A path that cannot be expressed
+    // there is refused (the dialog counts as cancelled) instead of being handed over garbled.
+    let Some(bytes) = to_ansi(&path) else {
+        event(format!("{kind} path {path:?} is not representable in the ANSI code page; cancelled"));
+        return 0;
+    };
     if o.lpstr_file.is_null() || bytes.len() + 2 > o.n_max_file as usize {
         return 0;
     }
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), o.lpstr_file, bytes.len());
     *o.lpstr_file.add(bytes.len()) = 0;
     *o.lpstr_file.add(bytes.len() + 1) = 0; // double NUL for multi-select style buffers
-    o.n_file_offset = path.rfind('\\').map(|i| i + 1).unwrap_or(0) as u16;
-    o.n_file_extension = path.rfind('.').map(|i| i + 1).unwrap_or(0) as u16;
+    let name_start = path.rfind('\\').map(|i| i + 1).unwrap_or(0);
+    let ext_start = path.rfind('.').map(|i| i + 1).filter(|&i| i > name_start);
+    o.n_file_offset = to_ansi(&path[..name_start]).map(|b| b.len()).unwrap_or(0) as u16;
+    o.n_file_extension = ext_start.and_then(|i| to_ansi(&path[..i])).map(|b| b.len()).unwrap_or(0) as u16;
     if idx != 0 {
         o.n_filter_index = idx;
     }
@@ -286,14 +315,38 @@ pub fn hooks() -> Vec<(&'static [u8], usize, &'static AtomicUsize)> {
 // window inspection helpers
 // ---------------------------------------------------------------------------------------------
 
-unsafe fn window_text(hwnd: *mut c_void) -> String {
-    let mut buf = [0u8; 512];
+/// Sends `msg` with a heap buffer of `cap` bytes as lParam and returns the buffer and the result.
+///
+/// If the call times out, the window may still process the message later and write into the buffer, so the
+/// buffer is then deliberately leaked instead of freed (a stack buffer here would be a use-after-return).
+unsafe fn send_with_buffer(hwnd: *mut c_void, msg: u32, wparam: usize, cap: usize, timeout_ms: u32) -> Option<(Vec<u8>, usize)> {
+    let mut buf = vec![0u8; cap];
     let mut res = 0usize;
-    let ok = SendMessageTimeoutA(hwnd, WM_GETTEXT, buf.len(), buf.as_mut_ptr() as isize, SMTO_ABORTIFHUNG, 500, &mut res);
-    if ok == 0 {
-        return "<timeout>".into();
+    if SendMessageTimeoutA(hwnd, msg, wparam, buf.as_mut_ptr() as isize, SMTO_ABORTIFHUNG, timeout_ms, &mut res) == 0 {
+        std::mem::forget(buf);
+        return None;
     }
-    String::from_utf8_lossy(&buf[..(res as usize).min(buf.len())]).trim_end_matches('\0').replace('\n', "\\n")
+    Some((buf, res))
+}
+
+/// Length reply of LB_GETTEXTLEN / SB_GETTEXTLENGTH style messages; None on timeout or LB_ERR.
+unsafe fn send_len(hwnd: *mut c_void, msg: u32, wparam: usize) -> Option<usize> {
+    let mut res = 0usize;
+    if SendMessageTimeoutA(hwnd, msg, wparam, 0, SMTO_ABORTIFHUNG, 1000, &mut res) == 0 {
+        return None;
+    }
+    if res as isize == -1 {
+        return None; // LB_ERR
+    }
+    Some(res)
+}
+
+unsafe fn window_text(hwnd: *mut c_void) -> String {
+    let cap = 512;
+    match send_with_buffer(hwnd, WM_GETTEXT, cap, cap, 500) {
+        None => "<timeout>".into(),
+        Some((buf, n)) => String::from_utf8_lossy(&buf[..n.min(cap)]).trim_end_matches('\0').replace('\n', "\\n"),
+    }
 }
 
 unsafe fn describe(hwnd: *mut c_void) -> String {
@@ -400,14 +453,21 @@ unsafe fn handle(cmd: &str) -> String {
             if SendMessageTimeoutA(h, 0x018B, 0, 0, SMTO_ABORTIFHUNG, 1000, &mut total) == 0 {
                 return "<timeout>".into();
             }
+            if total as isize == -1 {
+                return "count=0".into();
+            }
             let mut lines = vec![format!("count={total}")];
             for i in start..total.min(start.saturating_add(want)) {
-                let mut len = 0usize;
-                SendMessageTimeoutA(h, 0x018A, i, 0, SMTO_ABORTIFHUNG, 1000, &mut len);
-                let mut buf = vec![0u8; len.min(4096) + 2];
-                let mut n = 0usize;
-                SendMessageTimeoutA(h, 0x0189, i, buf.as_mut_ptr() as isize, SMTO_ABORTIFHUNG, 1000, &mut n);
-                lines.push(String::from_utf8_lossy(&buf[..n.min(buf.len())]).into_owned());
+                // LB_GETTEXT has no size argument: the buffer must be at least LB_GETTEXTLEN + 1.  If the length
+                // is unknown (timeout / LB_ERR) or absurd, the line is skipped instead of guessing a size.
+                let text = match send_len(h, 0x018A, i) {
+                    Some(len) if len <= 64 * 1024 => match send_with_buffer(h, 0x0189, i, len + 64, 1000) {
+                        Some((buf, n)) if n as isize >= 0 => String::from_utf8_lossy(&buf[..n.min(len)]).into_owned(),
+                        _ => String::new(),
+                    },
+                    _ => String::new(),
+                };
+                lines.push(text);
             }
             lines.join("\n")
         }
@@ -429,11 +489,15 @@ unsafe fn handle(cmd: &str) -> String {
             SendMessageTimeoutA(h, 0x0406, 0, 0, SMTO_ABORTIFHUNG, 1000, &mut count); // SB_GETPARTS
             let mut out = Vec::new();
             for i in 0..count.min(16) {
-                let mut buf = [0u8; 256];
-                let mut r = 0usize;
-                SendMessageTimeoutA(h, 0x0402, i, buf.as_mut_ptr() as isize, SMTO_ABORTIFHUNG, 1000, &mut r); // SB_GETTEXTA
-                let n = r & 0xFFFF;
-                out.push(format!("{i}\t{}", String::from_utf8_lossy(&buf[..n.min(255)])));
+                // SB_GETTEXTLENGTHA first: SB_GETTEXTA has no size argument either
+                let text = match send_len(h, 0x040C, i).map(|r| r & 0xFFFF) {
+                    Some(len) => match send_with_buffer(h, 0x0402, i, len + 64, 1000) {
+                        Some((buf, r)) => String::from_utf8_lossy(&buf[..(r & 0xFFFF).min(len)]).into_owned(),
+                        None => String::new(),
+                    },
+                    None => String::new(),
+                };
+                out.push(format!("{i}\t{text}"));
             }
             out.join("\n")
         }
@@ -447,6 +511,9 @@ unsafe fn handle(cmd: &str) -> String {
             let c = std::ffi::CString::new(text).unwrap_or_default();
             let mut res = 0usize;
             let ok = SendMessageTimeoutA(hw(0), 0x000C, 0, c.as_ptr() as isize, SMTO_ABORTIFHUNG, 1000, &mut res); // WM_SETTEXT
+            if ok == 0 {
+                std::mem::forget(c); // may still be read by the window later
+            }
             format!("settext -> ok={ok}")
         }
         "arm-open" | "arm-save" => {

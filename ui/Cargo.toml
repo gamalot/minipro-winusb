@@ -1,6 +1,6 @@
 [package]
 name = "minipro-ui"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 build = "build.rs"
 
@@ -15,4 +15,4 @@ winresource = "0.1"
 eframe = "0.37.0"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 rfd = "0.18.0"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Devices_DeviceAndDriverInstallation"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Storage_FileSystem"] }

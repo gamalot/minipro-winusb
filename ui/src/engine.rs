@@ -115,8 +115,9 @@ pub enum Job {
     /// close and re-launch the hidden official program (it never re-opens a device that was re-plugged)
     Restart,
     SelfCheck,
-    Run(Op),
-    LoadBuffer(Vec<u8>),
+    /// run an operation; for program / verify the data shown in the UI comes along and is handed to the engine
+    /// (and checked) right before, so the chip always gets exactly what is on screen
+    Run(Op, Option<Vec<u8>>),
     FetchBuffer,
     SetOption(OptionId, bool),
     Quit,
@@ -230,8 +231,28 @@ pub struct Engine {
     ctx: egui::Context,
 }
 
+/// A file in the temp directory for exchanging the buffer with the official program.  MiniPro is an ANSI
+/// program, so a temp directory with non-ASCII characters (e.g. a Chinese user name on a Western system) is
+/// replaced by its 8.3 short name when there is one.  Otherwise the path is used as it is and the shim refuses
+/// it if the ANSI code page cannot express it - the operation then fails cleanly instead of using stale data.
 fn temp_file(name: &str) -> PathBuf {
-    std::env::temp_dir().join(name)
+    let dir = std::env::temp_dir();
+    if dir.to_string_lossy().is_ascii() {
+        return dir.join(name);
+    }
+    short_path(&dir).filter(|p| p.to_string_lossy().is_ascii()).unwrap_or(dir).join(name)
+}
+
+fn short_path(p: &std::path::Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+    let wide: Vec<u16> = p.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut buf = vec![0u16; 1024];
+    let n = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n >= buf.len() {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&buf[..n])))
 }
 
 impl Engine {
@@ -486,6 +507,31 @@ impl Engine {
 
     // ---- buffer exchange --------------------------------------------------------------------
 
+    /// Hands `data` to the official program and checks that its buffer now really holds it: the checksum the
+    /// official window shows must equal the byte sum of `data`, padded with 0xFF up to the chip size.
+    /// Any failure is an error; the caller must then not start the operation.
+    fn push_buffer(&mut self, data: &[u8]) -> Result<(), String> {
+        if !self.load_buffer(data) {
+            return Err(tr("缓冲区没能交给编程引擎", "The buffer could not be handed to the engine").into());
+        }
+        let st = self.read_state();
+        let shown = st.checksum.trim().trim_start_matches("0x").trim_start_matches("0X").replace(' ', "");
+        let Ok(official) = u32::from_str_radix(&shown, 16) else {
+            return Err(trf!("读不出引擎缓冲区的校验和（{}）", "Cannot read the engine buffer's checksum ({})", st.checksum));
+        };
+        let pad = st.size.saturating_sub(data.len() as u64);
+        let ours = data.iter().fold(0u32, |a, b| a.wrapping_add(*b as u32)).wrapping_add((pad as u32).wrapping_mul(0xFF));
+        if official != ours {
+            return Err(trf!(
+                "引擎缓冲区的校验和 0x{:08X} 与界面数据 0x{:08X} 不一致",
+                "The engine buffer's checksum 0x{:08X} does not match the data on screen (0x{:08X})",
+                official,
+                ours
+            ));
+        }
+        Ok(())
+    }
+
     fn load_buffer(&mut self, data: &[u8]) -> bool {
         let path = temp_file("minipro_ui_buffer.bin");
         if std::fs::write(&path, data).is_err() {
@@ -498,6 +544,7 @@ impl Engine {
         self.post(&frame, WM_COMMAND, 57601);
         let Some((dlg, tree)) = self.wait_dialog(&known, 1059, Duration::from_secs(6)) else {
             self.call("disarm");
+            let _ = std::fs::remove_file(&path);
             self.log(Level::Error, tr("载入选项窗口没有出现", "The file-load options window did not appear"));
             return false;
         };
@@ -983,10 +1030,25 @@ pub fn spawn(ctx: egui::Context) -> (Sender<Job>, Receiver<Event>) {
                     let (ok, summary) = engine.run_selfcheck();
                     engine.send(Event::OpDone { op: tr("编程器自检", "Programmer self-check"), ok, summary });
                 }
-                Job::Run(op) => {
+                Job::Run(op, data) => {
                     engine.log(Level::Info, format!("—— {} ——", op.label()));
+                    let handed = match &data {
+                        None => Ok(()),
+                        Some(d) => {
+                            engine.progress(None, tr("正在把缓冲区交给编程引擎…", "Handing the buffer to the engine…"));
+                            let r = engine.push_buffer(d);
+                            if r.is_ok() {
+                                engine.log(Level::Info, trf!("缓冲区已交给引擎并核对无误 ({} 字节)", "Buffer handed to the engine and checked ({} bytes)", crate::app::with_commas(d.len() as u64)));
+                            }
+                            r
+                        }
+                    };
                     engine.progress(Some(0.0), format!("{}…", op.label()));
-                    let (ok, summary) = engine.run_op(op);
+                    let (ok, summary) = match handed {
+                        Ok(()) => engine.run_op(op),
+                        // never run on a buffer that is not the one on screen
+                        Err(msg) => (false, trf!("{}，操作已取消", "{}; the operation was not started", msg)),
+                    };
                     engine.send(Event::OpDone { op: op.label(), ok, summary });
                     let st = engine.read_state();
                     engine.send(Event::State(st));
@@ -995,14 +1057,6 @@ pub fn spawn(ctx: egui::Context) -> (Sender<Job>, Receiver<Event>) {
                             engine.send(Event::Buffer(d));
                         }
                     }
-                }
-                Job::LoadBuffer(data) => {
-                    engine.progress(None, tr("正在把缓冲区交给编程引擎…", "Handing the buffer to the engine…"));
-                    if engine.load_buffer(&data) {
-                        engine.log(Level::Info, trf!("缓冲区已载入 ({} 字节)", "Buffer loaded ({} bytes)", crate::app::with_commas(data.len() as u64)));
-                    }
-                    let st = engine.read_state();
-                    engine.send(Event::State(st));
                 }
                 Job::FetchBuffer => {
                     if let Some(d) = engine.fetch_buffer() {
