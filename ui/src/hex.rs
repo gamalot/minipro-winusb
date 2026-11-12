@@ -25,6 +25,9 @@ pub struct HexView {
 }
 
 const ROW: f32 = 24.0;
+/// Font size of the table. The monospace font is scaled by 1.2 (theme::install_fonts): 13 looks like the
+/// 15.5 used before that tweak, so the table keeps its size and width.
+const TABLE_FONT: f32 = 13.0;
 
 impl HexView {
     pub fn set_data(&mut self, data: Vec<u8>) {
@@ -124,14 +127,14 @@ impl HexView {
 
     /// Width the table needs (offset column, 16 bytes, ASCII column and padding), so the card around it can hug it.
     pub fn table_width(ui: &egui::Ui) -> f32 {
-        let mono = FontId::monospace(15.5);
+        let mono = FontId::monospace(TABLE_FONT);
         let cw = ui.painter().layout_no_wrap("0".into(), mono, Color32::WHITE).size().x;
         14.0 + cw * 11.0 + cw * (16.0 * 3.0 + 1.0 + 3.0) + cw * 16.0 + 14.0
     }
 
     /// Draw the view into the available space. `keys_enabled`: no text field has the keyboard focus.
     pub fn show(&mut self, ui: &mut egui::Ui, pal: &Palette, keys_enabled: bool) {
-        let mono = FontId::monospace(15.5);
+        let mono = FontId::monospace(TABLE_FONT);
         let cw = ui.painter().layout_no_wrap("0".into(), mono.clone(), Color32::WHITE).size().x;
         let pad = 14.0;
         let hex_x = pad + cw * 11.0;
@@ -231,7 +234,9 @@ impl HexView {
                 if row % 2 == 1 {
                     p.rect_filled(rect, CornerRadius::ZERO, pal.row_alt);
                 }
-                let y = rect.center().y + 1.5; // Consolas glyphs sit above the line box centre: keeps text and highlight on one centre line
+                // the monospace font is tweaked to sit centred in its line box (theme::install_fonts), and the
+                // highlight boxes below are centred on the row, so text and highlight share one centre line
+                let y = rect.center().y;
                 p.text(egui::pos2(rect.left() + pad, y), Align2::LEFT_CENTER, format!("{:08X}", row * 16), mono.clone(), pal.dim);
                 for i in 0..16 {
                     let idx = row * 16 + i;
@@ -253,15 +258,15 @@ impl HexView {
                         // one continuous band over the hit in both columns
                         let last = idx + 1 == hit.end || i == 15;
                         let w = if last { cw * 2.0 + 6.0 } else { cw * 3.0 + 1.0 };
-                        let r1 = Rect::from_min_size(egui::pos2(hx - 3.0, rect.top() + 0.5), Vec2::new(w, ROW - 4.0));
-                        let r2 = Rect::from_min_size(egui::pos2(ax - 1.0, rect.top() + 0.5), Vec2::new(cw + 2.0, ROW - 4.0));
+                        let r1 = Rect::from_min_size(egui::pos2(hx - 3.0, rect.top() + 2.0), Vec2::new(w, ROW - 4.0));
+                        let r2 = Rect::from_min_size(egui::pos2(ax - 1.0, rect.top() + 2.0), Vec2::new(cw + 2.0, ROW - 4.0));
                         for r in [r1, r2] {
                             p.rect_filled(r, CornerRadius::same(3), pal.accent.gamma_multiply(0.38));
                         }
                     }
                     if idx == self.cursor {
-                        let r1 = Rect::from_min_size(egui::pos2(hx - 3.0, rect.top() + 0.5), Vec2::new(cw * 2.0 + 6.0, ROW - 4.0));
-                        let r2 = Rect::from_min_size(egui::pos2(ax - 1.0, rect.top() + 0.5), Vec2::new(cw + 2.0, ROW - 4.0));
+                        let r1 = Rect::from_min_size(egui::pos2(hx - 3.0, rect.top() + 2.0), Vec2::new(cw * 2.0 + 6.0, ROW - 4.0));
+                        let r2 = Rect::from_min_size(egui::pos2(ax - 1.0, rect.top() + 2.0), Vec2::new(cw + 2.0, ROW - 4.0));
                         for r in [r1, r2] {
                             p.rect_filled(r, CornerRadius::same(4), pal.sel);
                             p.rect_stroke(r, CornerRadius::same(4), Stroke::new(1.0, pal.accent), StrokeKind::Inside);

@@ -1,4 +1,5 @@
 use crate::lang::{tr, trf};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -17,16 +18,43 @@ fn data_dir() -> PathBuf {
     d
 }
 
-fn load_chip_cache() -> Vec<ChipEntry> {
-    let Ok(text) = std::fs::read_to_string(data_dir().join("chips.tsv")) else { return Vec::new() };
-    text.lines()
-        .filter_map(|l| l.split_once('\t').map(|(m, n)| ChipEntry { mfr: m.to_string(), name: n.to_string() }))
-        .collect()
+const CHIP_CACHE: &str = "chips2.tsv";
+const CHIP_CACHE_HEADER: &str = "#minipro-ui chip database v2";
+
+/// The cached chip database: chips (`C<TAB>manufacturer<TAB>types<TAB>name`) and manufacturer full names
+/// (`M<TAB>manufacturer<TAB>full name`).  Anything else (e.g. the older `chips.tsv` without chip types) is
+/// ignored, so the database is built again.
+fn load_chip_cache() -> (Vec<ChipEntry>, HashMap<String, String>) {
+    let mut chips = Vec::new();
+    let mut names = HashMap::new();
+    let Ok(text) = std::fs::read_to_string(data_dir().join(CHIP_CACHE)) else { return (chips, names) };
+    let mut lines = text.lines();
+    if lines.next() != Some(CHIP_CACHE_HEADER) {
+        return (chips, names);
+    }
+    for l in lines {
+        let f: Vec<&str> = l.splitn(4, '\t').collect();
+        match f.as_slice() {
+            ["C", m, cats, n] => chips.push(ChipEntry { mfr: m.to_string(), cats: cats.parse().unwrap_or(0), name: n.to_string() }),
+            ["M", m, full] => {
+                names.insert(m.to_string(), full.to_string());
+            }
+            _ => {}
+        }
+    }
+    (chips, names)
 }
 
-fn save_chip_cache(list: &[ChipEntry]) {
-    let text: String = list.iter().map(|c| format!("{}\t{}\n", c.mfr, c.name)).collect();
-    let _ = std::fs::write(data_dir().join("chips.tsv"), text);
+fn save_chip_cache(list: &[ChipEntry], names: &HashMap<String, String>) {
+    let mut text = format!("{CHIP_CACHE_HEADER}\n");
+    for (m, full) in names {
+        text.push_str(&format!("M\t{m}\t{full}\n"));
+    }
+    for c in list {
+        text.push_str(&format!("C\t{}\t{}\t{}\n", c.mfr, c.cats, c.name));
+    }
+    let _ = std::fs::write(data_dir().join(CHIP_CACHE), text);
+    let _ = std::fs::remove_file(data_dir().join("chips.tsv")); // the old format
 }
 
 /// A titled rounded card.  Free function (not a method) so its closure may freely borrow the app.
@@ -60,7 +88,7 @@ fn split_version(s: &str) -> (String, String, String) {
 
 /// Shared look of every dialog: dimmed backdrop, rounded card in the theme's colours, title and close button in
 /// one header row.  Returns true when the dialog should close (close button, click outside, Esc).
-fn modal(ctx: &egui::Context, pal: &Palette, id: &str, title: &str, width: f32, add: impl FnOnce(&mut egui::Ui)) -> bool {
+pub(crate) fn modal(ctx: &egui::Context, pal: &Palette, id: &str, title: &str, width: f32, add: impl FnOnce(&mut egui::Ui)) -> bool {
     let mut close = false;
     let frame = Frame::new()
         .fill(pal.card)
@@ -98,7 +126,7 @@ fn modal(ctx: &egui::Context, pal: &Palette, id: &str, title: &str, width: f32, 
 }
 
 /// Segmented control: equal-width segments in one rounded track.  Returns the index that was clicked.
-fn segmented(ui: &mut egui::Ui, pal: &Palette, width: f32, items: &[(&str, bool)]) -> Option<usize> {
+pub(crate) fn segmented(ui: &mut egui::Ui, pal: &Palette, width: f32, items: &[(&str, bool)]) -> Option<usize> {
     let h = 36.0;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, h), Sense::hover());
     ui.painter().rect(rect, CornerRadius::same(10), pal.bg, Stroke::new(1.0, pal.stroke), egui::StrokeKind::Inside);
@@ -206,15 +234,16 @@ pub struct App {
     socket_view: bool,
     /// development aid: chip names whose diagrams are drawn side by side (script step `socketgrid:a|b|c`)
     socket_grid: Vec<String>,
+    /// self-test only: draw font samples for measuring glyph size and vertical position
+    font_probe: bool,
     about: bool,
 
     chip: ChipState,
     chips: Vec<ChipEntry>,
     building_chips: bool,
-    picker: bool,
-    search: String,
-    results: Vec<usize>,
-    results_for: String,
+    picker: crate::picker::Picker,
+    /// manufacturer short name -> full name, from the official database
+    mfr_names: HashMap<String, String>,
 
     hex: HexView,
     file_name: Option<String>,
@@ -260,7 +289,7 @@ impl App {
             .unwrap_or(1.0);
         cc.egui_ctx.set_zoom_factor(zoom);
         let (tx, rx) = engine::spawn(cc.egui_ctx.clone());
-        let chips = load_chip_cache();
+        let (chips, mfr_names) = load_chip_cache();
         App {
             tx,
             rx,
@@ -287,14 +316,13 @@ impl App {
             socket: None,
             socket_view: false,
             socket_grid: Vec::new(),
+            font_probe: false,
             about: false,
             chip: ChipState::default(),
             chips,
             building_chips: false,
-            picker: false,
-            search: String::new(),
-            results: Vec::new(),
-            results_for: "\u{0}".into(),
+            picker: Default::default(),
+            mfr_names,
             hex: HexView::default(),
             file_name: None,
             log: Vec::new(),
@@ -366,6 +394,7 @@ impl App {
                 let h: String = arg.chars().filter(|c| c.is_ascii_hexdigit()).collect();
                 let pat: Vec<u8> = (0..h.len() / 2).filter_map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).ok()).collect();
                 let found = self.hex.find(&pat);
+                self.find_text = arg.to_string();
                 self.say(Level::Info, format!("[test] find {arg}: {found} at 0x{:X}", self.hex.cursor));
             }
             "settings" => self.settings = arg != "off",
@@ -382,6 +411,7 @@ impl App {
             }
             "socketgrid" => self.socket_grid = arg.split('|').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect(),
             "socketview" => self.socket_view = arg != "off",
+            "fontprobe" => self.font_probe = arg != "off",
             "askselfcheck" => self.pending_selfcheck = arg != "off",
             "confirm" => self.pending = if arg == "off" { None } else { Some(Op::Program) },
             "zoom" => ctx.set_zoom_factor(arg.parse().unwrap_or(1.0)),
@@ -389,10 +419,13 @@ impl App {
             "theme" if arg == "auto" => self.set_auto(ctx),
             "theme" => self.set_dark(ctx, arg != "light"),
             "picker" => {
-                self.picker = true;
-                self.search = arg.to_string();
+                self.picker.open_at(&self.chips, &self.chip.name);
+                self.picker.search = arg.to_string();
             }
-            "closepicker" => self.picker = false,
+            // self-test only: picker filters, `pickcat:<0-5>` (0 = all types), `pickmfr:<name>` (empty = all)
+            "pickcat" => self.picker.cat = arg.parse::<usize>().ok().filter(|&k| k > 0).map(|k| k - 1),
+            "pickmfr" => self.picker.mfr = Some(arg.to_string()).filter(|m| !m.is_empty()),
+            "closepicker" => self.picker.open = false,
             // self-test only: the person running the test has agreed to the hardware write
             "program" => self.run(Op::Program),
             "erase" => self.run(Op::Erase),
@@ -433,6 +466,7 @@ impl App {
                 if let Ok(a) = usize::from_str_radix(arg.trim_start_matches("0x"), 16) {
                     self.hex.goto(a);
                 }
+                self.goto_text = arg.trim_start_matches("0x").to_string();
             }
             "quit" => {
                 if let Some(path) = std::env::var_os("MINIPRO_UI_LOGFILE") {
@@ -552,13 +586,13 @@ impl App {
                     self.hex.set_data(d);
                     self.file_name = None;
                 }
-                Event::ChipList(list) => {
+                Event::ChipList(list, names) => {
                     self.building_chips = false;
                     if !list.is_empty() {
-                        self.say(Level::Ok, trf!("芯片库已建立，共 {} 个型号", "Chip database built: {} chips", list.len()));
-                        save_chip_cache(&list);
+                        self.say(Level::Ok, trf!("芯片库已建立，共 {} 个型号", "Chip database built: {} chips", with_commas(list.len() as u64)));
+                        self.mfr_names = names.into_iter().collect();
+                        save_chip_cache(&list, &self.mfr_names);
                         self.chips = list;
-                        self.results_for = "\u{0}".into();
                     }
                 }
                 Event::OpDone { op, ok, summary } => {
@@ -811,9 +845,13 @@ impl App {
     /// Like `kv`, with a small button at the right end of the row; returns true when it was clicked.
     fn kv_action(&self, ui: &mut egui::Ui, key: &str, value: &str, mono: bool, label: &str, icon_font: bool, tip: &str, enabled: bool) -> bool {
         let mut clicked = false;
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(Vec2::new(104.0, 26.0), Layout::left_to_right(Align::Center), |ui| {
-                ui.set_min_size(Vec2::new(104.0, 26.0));
+        // One fixed row height for key, value and button: the button is the tallest item, and with a shorter key
+        // box the key was centred on a different line than the value (up to 5 pt higher).
+        const H: f32 = 34.0;
+        ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), H), Layout::left_to_right(Align::Center), |ui| {
+            ui.set_min_height(H);
+            ui.allocate_ui_with_layout(Vec2::new(104.0, H), Layout::left_to_right(Align::Center), |ui| {
+                ui.set_min_size(Vec2::new(104.0, H));
                 ui.label(RichText::new(key).color(self.pal.dim));
             });
             // button flush right, the value takes whatever is left of the row
@@ -822,9 +860,11 @@ impl App {
                 if icon_font {
                     text = text.family(FontFamily::Name("icons".into()));
                 }
-                let b = egui::Button::new(text).min_size(Vec2::new(34.0, 26.0)).corner_radius(CornerRadius::same(7));
+                ui.spacing_mut().button_padding.y = 2.0; // keeps the button within the row height
+                let b = egui::Button::new(text).min_size(Vec2::new(34.0, H)).corner_radius(CornerRadius::same(7));
                 clicked = ui.add_enabled(enabled, b).on_hover_text(tip).clicked();
-                ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 26.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), H), Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_min_height(H);
                     if value.is_empty() {
                         ui.label(RichText::new("—").color(self.pal.dim));
                     } else {
@@ -1071,7 +1111,7 @@ impl App {
                                     Level::Error => pal.err,
                                 };
                                 ui.horizontal_wrapped(|ui| {
-                                    ui.label(RichText::new(format!("{:>5.1}s", t)).monospace().size(12.5).color(pal.dim));
+                                    ui.label(RichText::new(format!("{:>5.1}s", t)).monospace().size(14.5).color(pal.dim));
                                     ui.label(RichText::new(msg).size(14.5).color(col));
                                 });
                             }
@@ -1113,7 +1153,7 @@ impl App {
                 card(&pal, ui, tr("芯片信息", "Chip"), |ui| {
                     let can = self.can();
                     if self.kv_action(ui, tr("型号", "Model"), &self.chip.name, false, "…", false, tr("选择芯片型号", "Choose the chip model"), can) {
-                        self.picker = true;
+                        self.picker.open_at(&self.chips, &self.chip.name);
                     }
                     self.kv(ui, tr("类型", "Type"), &self.chip.kind, false);
                     let cap = if self.chip.size > 0 {
@@ -1241,14 +1281,21 @@ impl App {
                         };
                         nudged(ui, tr("数据", "Data"), 13.5, pal.dim, 0.5);
                         ui.add_space(12.0);
+                        // The 32 px field height comes from the vertical margin, not from min_size: egui centres
+                        // the hint inside a taller field but draws typed text at its top. Hint and typed text use
+                        // one font, the size of the labels next to the fields, so nothing moves while typing.
+                        let field_font = egui::FontId::monospace(14.0);
+                        let field_h = ui.painter().layout_no_wrap("0".into(), field_font.clone(), Color32::WHITE).size().y;
+                        let pad_x = ui.spacing().button_padding.x.round() as i8;
+                        let pad_y = ((32.0 - field_h) / 2.0).max(0.0).round() as i8;
+                        let field_margin = egui::Margin { left: pad_x, right: pad_x, top: pad_y, bottom: pad_y };
                         nudged(ui, tr("跳转到 0x", "Go to 0x"), 14.0, pal.text, 0.0);
                         let r = ui.add(
                             egui::TextEdit::singleline(&mut self.goto_text)
                                 .desired_width(100.0)
-                                .hint_text(tr("地址", "Address"))
-                                .font(egui::TextStyle::Monospace)
-                                .vertical_align(Align::Center)
-                                .min_size(Vec2::new(0.0, 32.0)),
+                                .hint_text(RichText::new(tr("地址", "Address")).font(field_font.clone()))
+                                .font(field_font.clone())
+                                .margin(field_margin),
                         );
                         if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             if let Ok(a) = usize::from_str_radix(self.goto_text.trim().trim_start_matches("0x"), 16) {
@@ -1260,10 +1307,9 @@ impl App {
                         let r = ui.add(
                             egui::TextEdit::singleline(&mut self.find_text)
                                 .desired_width(180.0)
-                                .hint_text(if self.find_ascii { tr("文本", "Text") } else { tr("十六进制 如 DE AD", "Hex, e.g. DE AD") })
-                                .font(egui::TextStyle::Monospace)
-                                .vertical_align(Align::Center)
-                                .min_size(Vec2::new(0.0, 32.0)),
+                                .hint_text(RichText::new(if self.find_ascii { tr("文本", "Text") } else { tr("十六进制 如 DE AD", "Hex, e.g. DE AD") }).font(field_font.clone()))
+                                .font(field_font.clone())
+                                .margin(field_margin),
                         );
                         ui.selectable_value(&mut self.find_ascii, false, "HEX");
                         ui.selectable_value(&mut self.find_ascii, true, tr("文本", "Text"));
@@ -1282,7 +1328,7 @@ impl App {
                     });
                     ui.add_space(2.0);
                     // typed hex digits edit the buffer only when no dialog is open and no operation is running
-                    let modal_open = self.picker || self.pending.is_some() || self.pending_selfcheck || self.settings || self.about || self.socket_view || self.ask_close;
+                    let modal_open = self.picker.open || self.pending.is_some() || self.pending_selfcheck || self.settings || self.about || self.socket_view || self.ask_close;
                     let keys = !ui.ctx().egui_wants_keyboard_input() && !modal_open && !self.busy;
                     let footer_h = 30.0;
                     let avail = ui.available_height() - footer_h;
@@ -1297,6 +1343,7 @@ impl App {
                                     self.hex.cursor, b, b, b
                                 ))
                                 .monospace()
+                                .size(14.0)
                                 .color(pal.dim),
                             );
                         }
@@ -1307,79 +1354,10 @@ impl App {
     }
 
     fn chip_picker(&mut self, ctx: &egui::Context) {
-        if !self.picker {
-            return;
-        }
         let pal = self.pal;
-        if self.results_for != self.search {
-            let tokens: Vec<String> = self.search.to_lowercase().split_whitespace().map(|s| s.to_string()).collect();
-            let mut scored: Vec<(u8, usize)> = Vec::new();
-            for (i, c) in self.chips.iter().enumerate() {
-                let n = c.name.to_lowercase();
-                let hay = format!("{n} {}", c.mfr.to_lowercase());
-                if tokens.iter().all(|t| hay.contains(t.as_str())) {
-                    let rank = if tokens.first().map(|t| n.starts_with(t.as_str())).unwrap_or(true) { 0 } else { 1 };
-                    scored.push((rank, i));
-                }
-            }
-            scored.sort_by_key(|(r, i)| (*r, *i));
-            self.results = scored.into_iter().map(|(_, i)| i).collect();
-            self.results_for = self.search.clone();
-        }
-        let mut chosen: Option<usize> = None;
-        let close = modal(ctx, &pal, "chip-picker", tr("选择芯片", "Choose chip"), 600.0, |ui| {
-            if self.chips.is_empty() {
-                ui.add_space(30.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new(if self.building_chips { tr("正在建立芯片库，首次使用需要约半分钟…", "Building the chip database, the first run takes about half a minute…") } else { tr("芯片库尚未建立", "Chip database not built yet") }).color(pal.dim).size(17.0));
-                });
-                ui.add_space(30.0);
-                return;
-            }
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut self.search)
-                    .desired_width(f32::INFINITY)
-                    .margin(Margin::symmetric(12, 9))
-                    .hint_text(tr("输入型号，例如 SST39SF020A、W25Q64、24C02、ATMEGA328", "Type a model, e.g. SST39SF020A, W25Q64, 24C02, ATMEGA328"))
-                    .font(egui::FontId::proportional(17.0)),
-            );
-            if !r.has_focus() && !r.lost_focus() {
-                r.request_focus();
-            }
-            let n = self.results.len();
-            ui.add_space(4.0);
-            ui.label(RichText::new(trf!("共 {} 个型号，匹配 {n} 个", "{} chips, {n} match", with_commas(self.chips.len() as u64))).color(pal.dim).size(13.0));
-            ui.add_space(4.0);
-            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if enter && n > 0 {
-                chosen = Some(self.results[0]);
-            }
-            egui::ScrollArea::vertical().max_height(400.0).min_scrolled_height(400.0).auto_shrink([false, false]).show_rows(ui, 36.0, n.min(500), |ui, range| {
-                for k in range {
-                    let c = &self.chips[self.results[k]];
-                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::click());
-                    let p = ui.painter_at(rect);
-                    if resp.hovered() {
-                        p.rect_filled(rect, CornerRadius::same(8), pal.accent.gamma_multiply(0.22));
-                    } else if k % 2 == 1 {
-                        p.rect_filled(rect, CornerRadius::same(8), pal.row_alt);
-                    }
-                    p.text(rect.left_center() + Vec2::new(12.0, 0.0), Align2::LEFT_CENTER, &c.name, egui::FontId::proportional(16.0), pal.text);
-                    p.text(rect.right_center() - Vec2::new(12.0, 0.0), Align2::RIGHT_CENTER, &c.mfr, egui::FontId::proportional(13.5), pal.dim);
-                    if resp.clicked() {
-                        chosen = Some(self.results[k]);
-                    }
-                }
-            });
-        });
-        if close {
-            self.picker = false;
-        }
-        if let Some(i) = chosen {
+        if let crate::picker::Outcome::Chosen(i) = self.picker.show(ctx, &pal, &self.chips, &self.mfr_names, self.building_chips) {
             let chip = self.chips[i].clone();
-            self.picker = false;
             self.busy = true;
-            self.search.clear();
             let _ = self.tx.send(Job::SelectChip(chip));
         }
     }
@@ -1570,6 +1548,31 @@ impl eframe::App for App {
         self.about_window(&ctx);
         self.socket_window(&ctx);
         self.close_while_busy_dialog(&ctx);
+        if self.font_probe {
+            // black "H" samples on pink boxes the size of the laid-out row; a 100 pt bar gives the scale
+            egui::Area::new(egui::Id::new("font_probe")).fixed_pos(egui::pos2(20.0, 60.0)).order(egui::Order::Foreground).show(&ctx, |ui| {
+                Frame::new().fill(Color32::WHITE).inner_margin(Margin::same(10)).show(ui, |ui| {
+                    let (bar, _) = ui.allocate_exact_size(Vec2::new(100.0, 4.0), Sense::hover());
+                    ui.painter().rect_filled(bar, 0.0, Color32::from_rgb(0, 0, 255));
+                    let samples: [(&str, f32); 4] =
+                        [("p", 64.0), ("m", 64.0), ("p", 16.0), ("m", 16.0)];
+                    for (fam, size) in samples {
+                        let family = match fam {
+                            "p" => FontFamily::Proportional,
+                            "m" => FontFamily::Monospace,
+                            "b" => FontFamily::Name("bold".into()),
+                            _ => FontFamily::Name("icons".into()),
+                        };
+                        let text = if fam == "i" { "\u{E713}" } else { "HHHH" };
+                        let g = ui.painter().layout_no_wrap(text.to_string(), egui::FontId::new(size, family), Color32::BLACK);
+                        let (r, _) = ui.allocate_exact_size(g.size(), Sense::hover());
+                        ui.painter().rect_filled(r, 0.0, Color32::from_rgb(255, 200, 200));
+                        ui.painter().galley(r.min, g, Color32::BLACK);
+                        ui.add_space(6.0);
+                    }
+                });
+            });
+        }
         if !self.socket_grid.is_empty() {
             let pal = self.pal;
             egui::Area::new(egui::Id::new("socket_grid")).fixed_pos(egui::pos2(8.0, 8.0)).order(egui::Order::Foreground).show(&ctx, |ui| {

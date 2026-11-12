@@ -21,8 +21,10 @@ const WM_CLOSE: u32 = 0x0010;
 
 #[derive(Clone, Debug, Default)]
 pub struct ChipEntry {
-    pub name: String, // e.g. "SST39SF020A @PLCC32"
+    pub name: String, // e.g. "SST39SF020A @PLCC32", exactly as the official list has it (may be padded)
     pub mfr: String,
+    /// chip types (bit i = picker::CATS[i]), from the type buttons of the official dialog; a few chips have two
+    pub cats: u8,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -129,7 +131,8 @@ pub enum Event {
     Progress { frac: Option<f32>, text: String },
     State(ChipState),
     Buffer(Vec<u8>),
-    ChipList(Vec<ChipEntry>),
+    /// the chip database and the full names of the manufacturers (short name -> full name)
+    ChipList(Vec<ChipEntry>, Vec<(String, String)>),
     /// (official software line, device code, serial number)
     Programmer(String, String, String),
     /// the official "location in socket" picture: width, height, RGBA pixels (None = not available)
@@ -512,29 +515,71 @@ impl Engine {
         self.wait_dialog(&known, 1219, Duration::from_secs(6))
     }
 
-    fn list_chips(&mut self) -> Vec<ChipEntry> {
+    /// Reads the whole chip database out of the official "Select Device" dialog: every manufacturer with its
+    /// full name and chips (type "ALL"), then each type button once to learn the chip types.
+    fn list_chips(&mut self) -> (Vec<ChipEntry>, Vec<(String, String)>) {
         let Some((dlg, tree)) = self.open_select_dialog() else {
             self.log(Level::Error, tr("无法打开芯片库", "Cannot open the chip database"));
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let find = |id: i32| tree.iter().find(|w| w.id == id).map(|w| w.hwnd.clone()).unwrap_or_default();
-        let (mf, ch, ed) = (find(1219), find(1220), find(1033));
+        let (mf, ch, ed, full) = (find(1219), find(1220), find(1033), find(1229));
+        // type buttons: ALL, then ROM/FLASH/NVRAM, MCU/MPU, PLD/GAL/CPLD, SRAM/DRAM, Logic IC (= picker::CATS)
+        let all_types = find(1222);
+        let types: Vec<String> = (1223..=1227).map(find).collect();
         self.call(&format!("settext {ed} "));
+        if !all_types.is_empty() {
+            self.click(&all_types);
+        }
         std::thread::sleep(Duration::from_millis(400));
         let mfrs = self.lb(&mf);
         let mut all = Vec::new();
+        let mut names = Vec::new();
+        // (manufacturer, name) -> positions; the official lists have a few models twice under one manufacturer
+        let mut at: HashMap<(String, String), Vec<usize>> = HashMap::new();
+        let steps = (mfrs.len() * 2).max(1) as f32; // the type passes take about as long as the first pass
         for (i, m) in mfrs.iter().enumerate() {
             self.call(&format!("lbpick {mf} {i}"));
             std::thread::sleep(Duration::from_millis(60));
+            if !full.is_empty() {
+                names.push((m.clone(), self.text(&full).trim().to_string()));
+            }
             for name in self.lb(&ch) {
                 if !name.is_empty() {
-                    all.push(ChipEntry { name, mfr: m.clone() });
+                    at.entry((m.clone(), name.clone())).or_default().push(all.len());
+                    all.push(ChipEntry { name, mfr: m.clone(), cats: 0 });
                 }
             }
-            self.progress(Some((i + 1) as f32 / mfrs.len() as f32), trf!("正在建立芯片库 {}/{}", "Building the chip database {}/{}", i + 1, mfrs.len()));
+            self.progress(Some((i + 1) as f32 / steps), trf!("正在建立芯片库 {}/{}", "Building the chip database {}/{}", i + 1, mfrs.len()));
+        }
+        let mut done = 0usize;
+        let per_type = mfrs.len().max(1);
+        for (bit, button) in types.iter().enumerate() {
+            if button.is_empty() || self.broken {
+                continue;
+            }
+            self.click(button);
+            std::thread::sleep(Duration::from_millis(300));
+            let ms = self.lb(&mf);
+            for (i, m) in ms.iter().enumerate() {
+                self.call(&format!("lbpick {mf} {i}"));
+                std::thread::sleep(Duration::from_millis(50));
+                for name in self.lb(&ch) {
+                    for &k in at.get(&(m.clone(), name)).map(|v| v.as_slice()).unwrap_or(&[]) {
+                        all[k].cats |= 1 << bit;
+                    }
+                }
+                done += 1;
+                let frac = 0.5 + 0.5 * (done as f32 / (per_type as f32 * 1.1)).min(1.0);
+                self.progress(Some(frac), tr("正在读取芯片分类…", "Reading the chip types…"));
+            }
+        }
+        // leave the dialog on "ALL" (chip selection looks chips up in the full lists)
+        if !all_types.is_empty() {
+            self.click(&all_types);
         }
         self.close_dialog(&dlg.hwnd);
-        all
+        (all, names)
     }
 
     fn select_chip(&mut self, chip: &ChipEntry) -> bool {
@@ -545,6 +590,10 @@ impl Engine {
         let find = |id: i32| tree.iter().find(|w| w.id == id).map(|w| w.hwnd.clone()).unwrap_or_default();
         let (mf, ch, ed, ok) = (find(1219), find(1220), find(1033), find(1));
         self.call(&format!("settext {ed} "));
+        let all_types = find(1222);
+        if !all_types.is_empty() {
+            self.click(&all_types); // all types: the chip is looked up in the full lists
+        }
         std::thread::sleep(Duration::from_millis(350));
         let mfrs = self.lb(&mf);
         let Some(mi) = mfrs.iter().position(|m| *m == chip.mfr) else {
@@ -1052,8 +1101,8 @@ pub fn spawn(ctx: egui::Context) -> (Sender<Job>, Receiver<Event>) {
                     engine.send(Event::State(st));
                 }
                 Job::ListChips => {
-                    let list = engine.list_chips();
-                    engine.send(Event::ChipList(list));
+                    let (list, names) = engine.list_chips();
+                    engine.send(Event::ChipList(list, names));
                 }
                 Job::SelectChip(chip) => {
                     engine.progress(None, trf!("正在切换芯片 {}", "Switching chip {}", chip.name));

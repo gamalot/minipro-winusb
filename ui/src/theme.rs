@@ -107,7 +107,9 @@ pub fn apply(ctx: &egui::Context, p: &Palette) {
             (TextStyle::Body, FontId::new(16.0, FontFamily::Proportional)),
             (TextStyle::Button, FontId::new(16.0, FontFamily::Proportional)),
             (TextStyle::Heading, FontId::new(24.0, FontFamily::Proportional)),
-            (TextStyle::Monospace, FontId::new(15.0, FontFamily::Monospace)),
+            // same size as Body: with the tweak in install_fonts, monospace text of size N looks like
+            // proportional text of size N
+            (TextStyle::Monospace, FontId::new(16.0, FontFamily::Monospace)),
         ]
         .into();
     });
@@ -125,7 +127,14 @@ pub fn install_fonts(ctx: &egui::Context) {
         fonts.families.entry(FontFamily::Monospace).or_default().push("cjk".into());
     }
     if let Some(bytes) = load("consola.ttf") {
-        fonts.font_data.insert("mono".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+        // At the same point size Consolas is drawn smaller than Microsoft YaHei (cap height 0.635 em against
+        // 0.760 em) and sits high in its line box (glyph centre 0.16 em above the box centre, YaHei 0.02 em
+        // below; measured with the `fontprobe` self-test step). Scale it to the same cap height and move it
+        // down to the same place, so monospace and proportional text of one size match in size and line up
+        // when centred next to each other. (`scale` also scales advances and line height, so layout stays
+        // consistent.)
+        let tweak = egui::FontTweak { scale: 1.2, y_offset_factor: 0.18, ..Default::default() };
+        fonts.font_data.insert("mono".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes).tweak(tweak)));
         fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "mono".into());
     }
     // Windows 11 icon font, used for the left tool rail (falls back to the Segoe MDL2 set)

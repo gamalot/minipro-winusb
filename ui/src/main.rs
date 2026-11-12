@@ -5,6 +5,7 @@ mod engine;
 mod fileio;
 mod hex;
 mod lang;
+mod picker;
 mod socket;
 mod theme;
 mod usb;
